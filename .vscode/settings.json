@@ -1,0 +1,9 @@
+{
+    "python.defaultInterpreterPath": "C:/Users/HP/Desktop/LLM/.venv/Scripts/python.exe",
+    "python.REPL.enableREPLSmartSend": false,
+     "python.terminal.useEnvFile": true,
+    "python.analysis.extraPaths": [
+        "C:/Users/HP/Desktop/LLM/llm_backend",
+        "C:/Users/HP/Desktop/LLM/.venv/Lib/site-packages"
+    ]
+}
