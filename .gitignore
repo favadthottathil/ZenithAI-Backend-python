@@ -1,0 +1,51 @@
+# Virtual Environment
+.venv/
+venv/
+env/
+
+# Environment Variables
+.env
+
+# Python Cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# VS Code
+.vscode/
+
+# JetBrains IDEs
+.idea/
+
+# OS Files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Test Cache
+.pytest_cache/
+
+# Coverage
+.coverage
+htmlcov/
+
+# Build Files
+build/
+dist/
+*.egg-info/
+
+# SQLite
+*.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# MyPy
+.mypy_cache/
+
+# Temporary Files
+*.tmp
+*.temp
