@@ -1,11 +1,12 @@
 import os
 import uuid
 import json
-import socket
-from datetime import datetime
-from urllib.parse import urlparse
+import logging
+from datetime import datetime, timezone
 from motor.motor_asyncio import AsyncIOMotorClient
 from google import genai
+
+logger = logging.getLogger("zenith_ai")
 
 # Setup MongoDB Connection URI and database name
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
@@ -20,23 +21,49 @@ def is_mongodb_available(uri: str, timeout: float = 1.0) -> bool:
         client.admin.command('ping')
         return True
     except Exception as e:
-        print(f"MongoDB connection check failed: {e}")
+        logger.warning(f"MongoDB connection check failed: {e}")
         return False
 
 # Local File-based DB Directory fallback
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "conversations")
 
+
+def _validate_conversation_id(conversation_id: str) -> str:
+    """
+    Ensure the conversation id is a well-formed UUID.
+
+    This blocks path-traversal (e.g. ``../../foo``) in the local-JSON file
+    backend and keeps the MongoDB query key tightly constrained. Raises
+    ValueError on anything that is not a canonical UUID string.
+    """
+    try:
+        # uuid.UUID(...) rejects path separators, "..", etc. We re-stringify the
+        # canonical form so the value used downstream is normalized.
+        return str(uuid.UUID(conversation_id))
+    except (ValueError, AttributeError, TypeError):
+        raise ValueError(f"Invalid conversation_id: {conversation_id!r}")
+
+
+def _conversation_file_path(conversation_id: str) -> str:
+    """Resolve the on-disk path for a validated id, asserting it stays in DATA_DIR."""
+    safe_id = _validate_conversation_id(conversation_id)
+    path = os.path.join(DATA_DIR, f"{safe_id}.json")
+    # Defense-in-depth: the resolved path must live inside DATA_DIR.
+    if os.path.commonpath([os.path.realpath(path), os.path.realpath(DATA_DIR)]) != os.path.realpath(DATA_DIR):
+        raise ValueError(f"Resolved path escapes data directory: {conversation_id!r}")
+    return path
+
 # Determine active DB mode
 USE_MONGODB = is_mongodb_available(MONGO_URI, timeout=1.0)
 
 if USE_MONGODB:
-    print("Database Mode: [MongoDB] - Successfully connected to MongoDB server!")
+    logger.info("Database Mode: [MongoDB] - Successfully connected to MongoDB server!")
     client = AsyncIOMotorClient(MONGO_URI)
     db = client[DB_NAME]
     conversations_col = db["conversations"]
 else:
-    print(f"Database Mode: [Local JSON Files] - MongoDB was not found on {MONGO_URI}.")
-    print(f"Falling back to resilient Local JSON File Storage at: {os.path.abspath(DATA_DIR)}")
+    logger.info(f"Database Mode: [Local JSON Files] - MongoDB was not found on {MONGO_URI}.")
+    logger.info(f"Falling back to resilient Local JSON File Storage at: {os.path.abspath(DATA_DIR)}")
     # Ensure the local data directory exists
     os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -69,8 +96,8 @@ async def generate_chat_title(content: str) -> str:
         # Truncation fallback if returned title is blank or too wordy
         words = content.split()
         return " ".join(words[:4]) + "..." if len(words) > 4 else content
-    except Exception as e:
-        print("db_services: Failed to generate AI title, using fallback:", e)
+    except Exception:
+        logger.exception("Failed to generate AI title, using fallback")
         words = content.split()
         return " ".join(words[:4]) + "..." if len(words) > 4 else content
 
@@ -82,8 +109,9 @@ async def save_conversation(conversation_id: str, messages: list) -> dict:
     """
     if not conversation_id:
         conversation_id = str(uuid.uuid4())
-        
-    now = datetime.utcnow()
+    conversation_id = _validate_conversation_id(conversation_id)
+
+    now = datetime.now(timezone.utc)
     
     # Try to find existing conversation to check current title
     existing = await get_conversation_by_id(conversation_id)
@@ -139,7 +167,7 @@ async def save_conversation(conversation_id: str, messages: list) -> dict:
         )
     else:
         # JSON mode: save to file
-        file_path = os.path.join(DATA_DIR, f"{conversation_id}.json")
+        file_path = _conversation_file_path(conversation_id)
         # Format document with ISO formatted date for JSON compatibility
         json_doc = document.copy()
         json_doc["updated_at"] = now.isoformat()
@@ -170,15 +198,15 @@ async def get_all_conversations():
                         data = json.load(f)
                         # Reconstruct date object
                         updated_at_str = data.get("updated_at")
-                        updated_at_dt = datetime.fromisoformat(updated_at_str) if updated_at_str else datetime.utcnow()
+                        updated_at_dt = datetime.fromisoformat(updated_at_str) if updated_at_str else datetime.now(timezone.utc)
                         
                         conversations.append({
                             "conversation_id": data.get("conversation_id"),
                             "title": data.get("title", "New Chat"),
                             "updated_at": updated_at_dt
                         })
-                except Exception as e:
-                    print(f"Error reading file {filename}: {e}")
+                except Exception:
+                    logger.exception(f"Error reading file {filename}")
                     
         # Sort by updated_at descending
         conversations.sort(key=lambda x: x["updated_at"], reverse=True)
@@ -188,12 +216,17 @@ async def get_conversation_by_id(conversation_id: str):
     """
     Retrieves a single conversation by its ID.
     """
+    try:
+        conversation_id = _validate_conversation_id(conversation_id)
+    except ValueError:
+        return None
+
     if USE_MONGODB:
         convo = await conversations_col.find_one({"conversation_id": conversation_id}, {"_id": 0})
         return convo
     else:
         # JSON mode: read from file
-        file_path = os.path.join(DATA_DIR, f"{conversation_id}.json")
+        file_path = _conversation_file_path(conversation_id)
         if not os.path.exists(file_path):
             return None
         try:
@@ -203,25 +236,30 @@ async def get_conversation_by_id(conversation_id: str):
                 if "updated_at" in data and isinstance(data["updated_at"], str):
                     data["updated_at"] = datetime.fromisoformat(data["updated_at"])
                 return data
-        except Exception as e:
-            print(f"Error reading conversation file {conversation_id}: {e}")
+        except Exception:
+            logger.exception(f"Error reading conversation file {conversation_id}")
             return None
 
 async def delete_conversation_by_id(conversation_id: str):
     """
     Deletes a conversation by its ID.
     """
+    try:
+        conversation_id = _validate_conversation_id(conversation_id)
+    except ValueError:
+        return False
+
     if USE_MONGODB:
         result = await conversations_col.delete_one({"conversation_id": conversation_id})
         return result.deleted_count > 0
     else:
         # JSON mode: delete file
-        file_path = os.path.join(DATA_DIR, f"{conversation_id}.json")
+        file_path = _conversation_file_path(conversation_id)
         if os.path.exists(file_path):
             try:
                 os.remove(file_path)
                 return True
-            except Exception as e:
-                print(f"Error deleting conversation file {conversation_id}: {e}")
+            except Exception:
+                logger.exception(f"Error deleting conversation file {conversation_id}")
                 return False
         return False

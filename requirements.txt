@@ -5,3 +5,4 @@ motor
 python-dotenv
 pydantic
 pymongo
+slowapi
