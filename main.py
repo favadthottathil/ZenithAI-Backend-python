@@ -1,5 +1,6 @@
 import logging
 import os
+from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
@@ -19,6 +20,7 @@ from services.db_services import (
 )
 import asyncio
 import json
+import urllib.request
 import uuid
 
 load_dotenv()
@@ -26,11 +28,39 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("zenith_ai")
 
+# Render's free tier spins the service down after ~15 minutes with no inbound
+# traffic, which causes the next request's TLS handshake to be dropped while
+# the instance cold-starts. Periodically pinging our own public URL keeps the
+# instance warm and avoids that. RENDER_EXTERNAL_URL is set automatically by
+# Render; fall back to the known deployed URL for local/other environments.
+SELF_URL = os.getenv("RENDER_EXTERNAL_URL", "https://llm-backend-08lr.onrender.com")
+KEEP_ALIVE_INTERVAL_SECONDS = 13 * 60
+
 # Maximum accepted request body size (bytes). Acts as a coarse circuit-breaker
 # before per-field Pydantic limits are applied.
 MAX_REQUEST_BODY_BYTES = 25_000_000
 
-app = FastAPI()
+
+async def _keep_alive_loop():
+    while True:
+        await asyncio.sleep(KEEP_ALIVE_INTERVAL_SECONDS)
+        try:
+            await asyncio.to_thread(urllib.request.urlopen, SELF_URL, timeout=10)
+            logger.info("Keep-alive ping sent to %s", SELF_URL)
+        except Exception:
+            logger.exception("Keep-alive ping failed")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    task = asyncio.create_task(_keep_alive_loop())
+    try:
+        yield
+    finally:
+        task.cancel()
+
+
+app = FastAPI(lifespan=lifespan)
 
 # Rate limiting (per-client-IP) to protect the paid Gemini API from abuse.
 limiter = Limiter(key_func=get_remote_address)
