@@ -1,5 +1,6 @@
 fastapi
 uvicorn
+websockets
 google-genai
 motor
 python-dotenv

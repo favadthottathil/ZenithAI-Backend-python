@@ -3,9 +3,10 @@ import os
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
+from pydantic import ValidationError
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
@@ -155,16 +156,13 @@ async def chat(req: ChatRequest, request: Request):
 
      return {"response" : result}
 
-async def stream_genarator(messages, conversation_id=None):
-     logger.info(f"Received request with {len(messages)} messages (conversation_id={conversation_id})")
-
-     # If the frontend hasn't created a conversation yet (new chat), generate
-     # a real ID now and send it back as the very first event so the
-     # frontend can track this conversation from the start.
-     if not conversation_id:
-          conversation_id = str(uuid.uuid4())
-          yield f"data: \x00CONV_ID:{conversation_id}\n\n"
-
+async def generate_reply_words(messages, conversation_id):
+     """
+     Transport-agnostic generation core: calls Gemini, paces the response out
+     word-by-word, and persists the finished conversation. Yields plain text
+     words (no SSE/WS framing) so any transport can wrap them as it likes.
+     Raises on unrecoverable errors; the caller decides how to report them.
+     """
      prompt = build_prompt(messages)
 
      structured_instruction = """
@@ -186,7 +184,7 @@ Just explain step-by-step.
                    contents=contents,
                )
 
-               # Buffer raw text and yield word by word with a 80ms pacing delay
+               # Buffer raw text and yield word by word with an 80ms pacing delay
                buffer = ""
                for chunk in stream:
                    if hasattr(chunk, "text") and chunk.text:
@@ -207,46 +205,44 @@ Just explain step-by-step.
                            if boundary_idx != -1:
                                word = buffer[:boundary_idx]
                                buffer = buffer[boundary_idx:]
-                               yield f"data: {_encode_sse_chunk(word)}\n\n"
+                               yield word
                                await asyncio.sleep(0.08)
                            else:
                                break
 
                # Yield any remaining text
-               if buffer:
-                   while buffer:
-                       boundary_idx = -1
-                       has_non_space = False
-                       for idx, char in enumerate(buffer):
-                           if char in (' ', '\n', '\r', '\t'):
-                               if has_non_space:
-                                   boundary_idx = idx
-                                   break
-                           else:
-                               has_non_space = True
-                       if boundary_idx != -1:
-                           word = buffer[:boundary_idx]
-                           buffer = buffer[boundary_idx:]
-                           yield f"data: {_encode_sse_chunk(word)}\n\n"
-                           await asyncio.sleep(0.08)
+               while buffer:
+                   boundary_idx = -1
+                   has_non_space = False
+                   for idx, char in enumerate(buffer):
+                       if char in (' ', '\n', '\r', '\t'):
+                           if has_non_space:
+                               boundary_idx = idx
+                               break
                        else:
-                           yield f"data: {_encode_sse_chunk(buffer)}\n\n"
-                           buffer = ""
+                           has_non_space = True
+                   if boundary_idx != -1:
+                       word = buffer[:boundary_idx]
+                       buffer = buffer[boundary_idx:]
+                       yield word
+                       await asyncio.sleep(0.08)
+                   else:
+                       yield buffer
+                       buffer = ""
 
                logger.info(f"Stream completed using {current_model}")
 
                # Save the conversation history in MongoDB asynchronously
-               if conversation_id:
-                   try:
-                       messages_list = []
-                       for m in messages:
-                           messages_list.append({"role": m.role, "content": m.content})
-                       messages_list.append({"role": "assistant", "content": full_response})
+               try:
+                   messages_list = []
+                   for m in messages:
+                       messages_list.append({"role": m.role, "content": m.content})
+                   messages_list.append({"role": "assistant", "content": full_response})
 
-                       await save_conversation(conversation_id, messages_list)
-                       logger.info(f"Saved history for conversation {conversation_id}")
-                   except Exception as save_err:
-                       logger.exception(f"Database save failed for conversation {conversation_id}")
+                   await save_conversation(conversation_id, messages_list)
+                   logger.info(f"Saved history for conversation {conversation_id}")
+               except Exception:
+                   logger.exception(f"Database save failed for conversation {conversation_id}")
 
                return  # Success, exit the retry loop
 
@@ -262,23 +258,104 @@ Just explain step-by-step.
                 continue
 
             if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
-                yield "data: Error: The AI is currently busy (Rate Limit). Please wait 30 seconds and try again.\n\n"
-            else:
-                yield "data: Error: Something went wrong while generating the response. Please try again.\n\n"
-            return
-
-def _encode_sse_chunk(text: str) -> str:
-    # Escape newlines so a chunk's payload never contains "\n\n", which is
-    # the event delimiter the frontend's SSE parser splits on. Without this,
-    # paragraph breaks in the model's response corrupt the event framing.
-    return text.replace("\r\n", "\n").replace("\n", " ")
+                raise RuntimeError("The AI is currently busy (Rate Limit). Please wait 30 seconds and try again.") from e
+            raise RuntimeError("Something went wrong while generating the response. Please try again.") from e
 
 
-@app.post("/chat-stream")
-@limiter.limit("10/minute")
-async def chat_steam(req: ChatRequest, request: Request):
-     logger.info(f"Hit /chat-stream endpoint with conversation_id={req.conversation_id}")
-     return StreamingResponse(
-          stream_genarator(req.messages, req.conversation_id),
-          media_type="text/event-stream"
-     )
+# WebSocket connection start times per client IP, used for a simple sliding-window
+# rate limit (slowapi's decorator only covers HTTP routes, not WebSocket routes).
+_ws_rate_limit_window: dict[str, list[float]] = {}
+WS_RATE_LIMIT_PER_MINUTE = 10
+
+
+def _ws_rate_limited(client_host: str) -> bool:
+    now = asyncio.get_event_loop().time()
+    window_start = now - 60
+    timestamps = [t for t in _ws_rate_limit_window.get(client_host, []) if t > window_start]
+    timestamps.append(now)
+    _ws_rate_limit_window[client_host] = timestamps
+    return len(timestamps) > WS_RATE_LIMIT_PER_MINUTE
+
+
+@app.websocket("/ws/chat-stream")
+async def ws_chat_stream(ws: WebSocket):
+    origin = ws.headers.get("origin")
+    if _allowed_origins and origin and origin not in _allowed_origins:
+        await ws.close(code=1008)
+        return
+
+    await ws.accept()
+
+    client_host = ws.client.host if ws.client else "unknown"
+    if _ws_rate_limited(client_host):
+        await ws.send_json({"type": "error", "message": "You're sending messages too quickly. Please wait a moment and try again."})
+        await ws.close(code=1008)
+        return
+
+    try:
+        init = await ws.receive_json()
+    except (json.JSONDecodeError, WebSocketDisconnect):
+        return
+
+    if init.get("action") != "start":
+        await ws.send_json({"type": "error", "message": "Expected a 'start' action."})
+        await ws.close(code=1003)
+        return
+
+    try:
+        req = ChatRequest(messages=init.get("messages", []), conversation_id=init.get("conversation_id"))
+    except ValidationError:
+        await ws.send_json({"type": "error", "message": "Your message couldn't be sent. Please check your input and attachments."})
+        await ws.close(code=1003)
+        return
+
+    conversation_id = req.conversation_id
+    logger.info(f"WS chat-stream started (conversation_id={conversation_id})")
+
+    # New chat: mint a real ID up front and tell the client immediately.
+    if not conversation_id:
+        conversation_id = str(uuid.uuid4())
+        await ws.send_json({"type": "conversation_id", "conversation_id": conversation_id})
+
+    generator = generate_reply_words(req.messages, conversation_id)
+    generation_task = asyncio.ensure_future(generator.__anext__())
+    receive_task = asyncio.ensure_future(ws.receive_json())
+
+    try:
+        while True:
+            done, _pending = await asyncio.wait(
+                {generation_task, receive_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+
+            if receive_task in done:
+                try:
+                    incoming = receive_task.result()
+                except (WebSocketDisconnect, json.JSONDecodeError):
+                    generation_task.cancel()
+                    break
+                if incoming.get("action") == "stop":
+                    generation_task.cancel()
+                    break
+                receive_task = asyncio.ensure_future(ws.receive_json())
+                continue
+
+            if generation_task in done:
+                try:
+                    word = generation_task.result()
+                except StopAsyncIteration:
+                    await ws.send_json({"type": "done"})
+                    break
+                except RuntimeError as e:
+                    await ws.send_json({"type": "error", "message": str(e)})
+                    break
+                await ws.send_json({"type": "chunk", "data": word})
+                generation_task = asyncio.ensure_future(generator.__anext__())
+    except WebSocketDisconnect:
+        generation_task.cancel()
+    finally:
+        receive_task.cancel()
+        await generator.aclose()
+        try:
+            await ws.close()
+        except Exception:
+            pass
