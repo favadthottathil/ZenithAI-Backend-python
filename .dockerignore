@@ -9,6 +9,7 @@ data/
 # Version control, virtualenvs, caches
 .git
 .gitignore
+.github/
 .venv/
 venv/
 env/
