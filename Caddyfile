@@ -1,0 +1,8 @@
+# Plain HTTP on :80 for local testing. On a real server, replace ":80" with your
+# domain name (e.g. api.example.com) and Caddy obtains and renews a TLS
+# certificate automatically, which also gives the app wss:// for free.
+:80 {
+	# Caddy detects the WebSocket Upgrade handshake and tunnels the connection
+	# by itself; unlike nginx, no Upgrade/Connection headers need to be set.
+	reverse_proxy api:8000
+}
