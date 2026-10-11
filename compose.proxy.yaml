@@ -1,0 +1,24 @@
+# Production-style setup: the API is reachable only through Caddy.
+#   docker compose -f compose.yaml -f compose.proxy.yaml up -d --build
+# (Passing -f explicitly skips compose.override.yaml, so no dev mounts/reload.)
+services:
+  api:
+    # Drop the host port published in compose.yaml; only Caddy is exposed.
+    ports: !reset []
+
+  caddy:
+    image: caddy:2.11.7-alpine
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  caddy_data:
+  caddy_config:
