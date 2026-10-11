@@ -1,0 +1,22 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    restart: unless-stopped
+    # Idle use is ~70 MiB; limits stop a runaway request from taking the host.
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+    # The app needs no Linux capabilities (it binds port 8000) and never needs
+    # to gain privileges, so drop all of them.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true

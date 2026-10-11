@@ -1,0 +1,14 @@
+# Development overrides. Compose merges this file automatically on a plain
+# `docker compose up`. For production parity use:
+#   docker compose -f compose.yaml up -d --build
+services:
+  api:
+    # --reload restarts uvicorn when a mounted source file changes.
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    # Mount only the source, not the whole repo: mounting ./ would hide the
+    # image's /app/data and make the JSON fallback write into the git-tracked
+    # ./data folder on the host.
+    volumes:
+      - ./main.py:/app/main.py
+      - ./models:/app/models
+      - ./services:/app/services

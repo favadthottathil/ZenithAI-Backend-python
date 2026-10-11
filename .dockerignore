@@ -1,0 +1,30 @@
+# Secrets: injected at run time, never baked into the image
+.env
+.env.*
+!.env.example
+
+# Real user data (chat history); the app recreates data/conversations/ itself
+data/
+
+# Version control, virtualenvs, caches
+.git
+.gitignore
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+
+# Editor and tooling config
+.vscode/
+.idea/
+pyrefly.toml
+
+# Not needed at run time: tests (standalone scripts), docs, Docker files
+test_*.py
+*.md
+Dockerfile
+.dockerignore
+compose*.yaml
